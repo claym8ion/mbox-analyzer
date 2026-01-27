@@ -1,0 +1,4 @@
+anthropic
+tqdm
+tenacity
+html2text

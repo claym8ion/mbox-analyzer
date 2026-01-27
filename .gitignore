@@ -1,0 +1,16 @@
+# Source data (6.3GB mbox file)
+src_data/
+
+# Pipeline output (parsed JSON, analysis results, report)
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+*.Zone.Identifier
