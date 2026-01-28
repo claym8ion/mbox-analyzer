@@ -409,13 +409,61 @@ def _merge_batch_results(quarter: str, batch_results: list[dict]) -> dict:
 # Pass 2: Consolidation
 # ---------------------------------------------------------------------------
 
+def _compact_quarter_summary(analysis: dict) -> dict:
+    """Create a compact summary of a quarter analysis for consolidation."""
+    return {
+        "quarter": analysis.get("quarter", ""),
+        "projects": [
+            {"name": p.get("name", ""), "role": p.get("role", ""), "status": p.get("status", "")}
+            for p in analysis.get("projects", [])[:15]  # top 15 projects
+        ],
+        "accomplishments": [
+            {"description": a.get("description", ""), "category": a.get("category", "")}
+            for a in analysis.get("accomplishments", [])[:10]  # top 10
+        ],
+        "feedback_positive": [
+            f.get("content", "")[:200] for f in analysis.get("feedback", {}).get("received_positive", [])[:5]
+        ],
+        "feedback_constructive": [
+            f.get("content", "")[:200] for f in analysis.get("feedback", {}).get("received_constructive", [])[:3]
+        ],
+        "key_relationships": [
+            r.get("person", "") for r in analysis.get("key_relationships", [])[:10]
+        ],
+        "themes": analysis.get("themes", [])[:10],
+    }
+
+
+YEAR_CONSOLIDATION_SYSTEM = """You are an expert career analyst consolidating quarterly email analyses for a single year.
+
+Synthesize the quarters into a yearly summary with:
+1. **Projects**: Major initiatives that year (deduplicate across quarters)
+2. **Accomplishments**: Top 10 achievements for the year
+3. **Feedback**: Key positive and constructive feedback received
+4. **Relationships**: Most important professional relationships
+5. **Themes**: Dominant themes for the year
+6. **Year Summary**: 2-3 sentence summary of the year
+
+Return valid JSON:
+{
+  "year": "YYYY",
+  "projects": [{"name": "", "role": "", "key_outcomes": []}],
+  "top_accomplishments": [{"description": "", "category": "", "impact": ""}],
+  "feedback": {"positive": [], "constructive": []},
+  "key_relationships": [{"person": "", "relationship": ""}],
+  "themes": [],
+  "year_summary": ""
+}"""
+
+
 def consolidate(
     client: anthropic.Anthropic,
     quarters: list[str],
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
+    batch_delay: float = 60.0,
 ) -> dict:
-    """Run Pass 2: consolidate all quarter analyses into unified result."""
+    """Run Pass 2: hierarchical consolidation (by year, then final)."""
     SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
     result_path = SUMMARY_DIR / "consolidated.json"
 
@@ -424,33 +472,59 @@ def consolidate(
         log.info("Consolidated analysis already exists, skipping.")
         return existing
 
-    # Collect quarter analyses
-    quarter_summaries = []
+    # Collect quarter analyses grouped by year
+    by_year: dict[str, list] = {}
     for q in sorted(quarters):
         analysis = safe_json_load(str(ANALYSIS_DIR / f"{q}_analysis.json"))
         if analysis:
-            quarter_summaries.append(analysis)
+            year = q.split("_")[0]
+            by_year.setdefault(year, []).append(analysis)
 
-    if not quarter_summaries:
+    if not by_year:
         log.error("No quarter analyses found for consolidation")
         return {}
 
-    summaries_text = ""
-    for qs in quarter_summaries:
-        summaries_text += f"\n\n=== {qs.get('quarter', 'unknown')} ===\n"
-        summaries_text += json.dumps(qs, indent=1, default=str)
+    # Phase 1: Consolidate each year
+    year_summaries = []
+    for year in sorted(by_year.keys()):
+        year_path = SUMMARY_DIR / f"{year}_summary.json"
+        cached = safe_json_load(str(year_path))
+        if cached and not cached.get("parse_error"):
+            log.info(f"Year {year} summary cached, skipping.")
+            year_summaries.append(cached)
+            continue
+
+        quarters_data = by_year[year]
+        compact = [_compact_quarter_summary(q) for q in quarters_data]
+        summaries_text = json.dumps(compact, indent=1, default=str)
+
+        if dry_run:
+            year_summaries.append({"year": year, "dry_run": True})
+            continue
+
+        user_msg = f"Year: {year}\n\nQuarterly analyses:\n{summaries_text}\n\nConsolidate into a yearly summary."
+        log.info(f"Consolidating year {year}: {len(quarters_data)} quarters, "
+                 f"~{estimate_tokens(user_msg)}tok input")
+
+        raw = _call_claude(client, YEAR_CONSOLIDATION_SYSTEM, user_msg, model=model, max_tokens=8192)
+        result = _parse_json_response(raw)
+        result["year"] = year
+        safe_json_dump(result, str(year_path))
+        year_summaries.append(result)
+
+        time.sleep(batch_delay)
 
     if dry_run:
-        total_tokens = estimate_tokens(PASS2_SYSTEM + summaries_text)
-        return {
-            "quarter_count": len(quarter_summaries),
-            "estimated_input_tokens": total_tokens,
-            "estimated_cost_usd": round(total_tokens * 3 / 1_000_000, 2),
-            "dry_run": True,
-        }
+        return {"years": len(year_summaries), "dry_run": True}
+
+    # Phase 2: Final consolidation of yearly summaries
+    summaries_text = ""
+    for ys in year_summaries:
+        summaries_text += f"\n\n=== {ys.get('year', 'unknown')} ===\n"
+        summaries_text += json.dumps(ys, indent=1, default=str)
 
     user_msg = PASS2_USER_TEMPLATE.format(quarterly_summaries=summaries_text)
-    log.info(f"Consolidation: {len(quarter_summaries)} quarters, "
+    log.info(f"Final consolidation: {len(year_summaries)} years, "
              f"~{estimate_tokens(user_msg)}tok input")
 
     raw = _call_claude(
